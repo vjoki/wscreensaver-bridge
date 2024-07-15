@@ -1,5 +1,6 @@
-# DEPRECATED
-I no longer use nor need this, and will use https://wiki.hyprland.org/Hypr-Ecosystem/hypridle/ instead.
+# ~~DEPRECATED~~
+~~I no longer use nor need this, and will use https://wiki.hyprland.org/Hypr-Ecosystem/hypridle/ instead.~~
+Still useful with sway.
 
 # wscreensaver-bridge
 

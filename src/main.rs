@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 // Bridbe between the org.freedesktop.ScreenSaver interface and the Wayland idle
 // inhibitor protocol.
 
@@ -59,17 +60,17 @@ impl OrgFreedesktopScreenSaver for Arc<Mutex<OrgFreedesktopScreenSaverServer>> {
                 e
             )));
         }
-        log::info!(
-            "Inhibiting screensaver for {:?} because {:?}.",
-            application_name,
-            reason_for_inhibit
-        );
         let cookie = self.lock().unwrap().insert_inhibitor(StoredInhibitor {
             inhibitor: inhibitor.unwrap(),
-            name: application_name,
-            reason: reason_for_inhibit,
+            name: application_name.clone(),
+            reason: reason_for_inhibit.clone(),
         });
-        log::info!("Inhibitor cookie is {:?}", cookie);
+        log::info!(
+            "Inhibiting screensaver for {:?} because {:?}. Inhibitor cookie is {:?}.",
+            application_name,
+            reason_for_inhibit,
+            cookie,
+        );
         return Ok((cookie,));
     }
 

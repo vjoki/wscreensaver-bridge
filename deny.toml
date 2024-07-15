@@ -1,0 +1,10 @@
+[licenses]
+allow = [
+    "MIT",
+    "ISC",
+    "Unicode-DFS-2016",
+    "GPL-2.0",
+]
+
+[bans]
+multiple-versions = "allow"
