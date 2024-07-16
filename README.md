@@ -1,14 +1,15 @@
 # ~~DEPRECATED~~
 ~~I no longer use nor need this, and will use https://wiki.hyprland.org/Hypr-Ecosystem/hypridle/ instead.~~
-Still useful with sway.
+Still useful with Sway.
 
 # wscreensaver-bridge
 
 This is a D-Bus server that implements
-[org.freedesktop.ScreenSaver](https://specifications.freedesktop.org/idle-inhibition-spec/idle-inhibition-spec-latest.html)
+[org.freedesktop.ScreenSaver](https://specifications.freedesktop.org/idle-inhibit-spec/latest/)
 and forwards the calls to the [Wayland idle-inhibit
 protocol](https://wayland.app/protocols/idle-inhibit-unstable-v1) of your
-Wayland compositor.
+Wayland compositor and/or the [systemd-logind D-Bus
+interface](https://www.freedesktop.org/software/systemd/man/latest/org.freedesktop.login1.html).
 
 ## Why?
 
@@ -23,15 +24,7 @@ a bridge/adapter.
 
 ## Install/build
 
-On Arch, just install it from the AUR, e.g. using
-[yay](https://github.com/Jguer/yay):
-
- ``` sh
-    yay -S wscreensaver-bridge-git
- ```
-
- To build, just install rust and make sure you have the dbus development
- packages.
+To build, just install rust and run `cargo build --release`.
 
 ## Use
 
@@ -57,3 +50,9 @@ WantedBy=default.target
 ```
 
 Then enable it with `systemctl --user enable wscreensaver-bridge.service`.
+
+## Other similar utils
+- [inhibit-bridge](https://github.com/bdwalton/inhibit-bridge) - Utility for
+  bridging org.freedesktop.ScreenSaver to systemd-logind written in Go.
+- [sd-inhibit-bridge](https://github.com/notpeelz/sd-inhibit-bridge) - Utility for
+  bridging org.freedesktop.ScreenSaver to systemd-logind written in C.

@@ -4,6 +4,13 @@ version = "0.1.0"
 edition = "2021"
 license = "GPL-2.0-only"
 
+[features]
+default = ["wayland"]
+# Bridge org.freedesktop.ScreenSaver inhibit to systemd-logind D-Bus interface (org.freedesktop.login1).
+systemd = []
+# Bridge org.freedesktop.ScreenSaver inhibit to Wayland idle-inhibit (zwp_idle_inhibit_manager_v1).
+wayland = ["dep:wayland-client", "dep:wayland-protocols"]
+
 [dependencies]
 zbus = { version = "4.3.1", default-features = false, features = ["tokio"] }
 zbus_macros = "4.3.1"
@@ -11,7 +18,7 @@ log = "0.4.20"
 pretty_env_logger = "0.5.0"
 fastrand = "2.1.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
-wayland-client = "0.31.3"
-wayland-protocols = { version = "0.32.1", features = ["unstable", "client"] }
+wayland-client = { version = "0.31.3", optional = true }
+wayland-protocols = { version = "0.32.1", features = ["unstable", "client"], optional = true }
 ctrlc = { version = "3.4", features = ["termination"] }
 anyhow = "1"

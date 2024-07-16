@@ -1,8 +1,6 @@
 #![forbid(unsafe_code)]
-// Bridbe between the org.freedesktop.ScreenSaver interface and the Wayland idle
-// inhibitor protocol.
-mod wayland;
-
+// Bridge between the org.freedesktop.ScreenSaver interface and either the Wayland idle
+// inhibitor protocol or systemd-logind D-Bus interface (org.freedesktop.login1).
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
@@ -13,21 +11,38 @@ use zbus::message::Header;
 use zbus::names::UniqueName;
 use zbus::fdo;
 use zbus_macros::interface;
-use wayland::InhibitorManager;
-use wayland_protocols::wp::idle_inhibit::zv1::client::zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1;
+#[cfg(feature = "wayland")]
+use {
+    wayland_protocols::wp::idle_inhibit::zv1::client::zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1,
+    crate::wayland::InhibitorManager,
+};
+#[cfg(feature = "systemd")]
+use {
+    zbus::zvariant,
+    crate::xdg_login1::Login1Client,
+};
 
-// TODO: add a way to list inhibitors
-#[allow(dead_code)]
+#[cfg(feature = "wayland")]
+mod wayland;
+
+#[cfg(feature = "systemd")]
+mod xdg_login1;
+
 #[derive(Debug)]
 struct StoredInhibitor {
+    #[cfg(feature = "wayland")]
     inhibitor: ZwpIdleInhibitorV1,
-    name: String,
-    reason: String,
     sender: UniqueName<'static>,
+    #[cfg(feature = "systemd")]
+    /// org.freedesktop.login1 inhibitor lock, should uninhibit on drop.
+    _fd: zvariant::OwnedFd
 }
 
 #[derive(Debug)]
 struct OrgFreedesktopScreenSaverServer {
+    #[cfg(feature = "systemd")]
+    login1: Login1Client,
+    #[cfg(feature = "wayland")]
     inhibit_manager: Arc<InhibitorManager>,
     // NOTE: Must not be held across await points.
     inhibitors_by_cookie: Arc<Mutex<HashMap<u32, StoredInhibitor>>>,
@@ -66,19 +81,27 @@ impl OrgFreedesktopScreenSaverServer {
             return Err(fdo::Error::Failed("No sender provided".to_string()));
         };
 
+        #[cfg(feature = "wayland")]
         let inhibitor = self.inhibit_manager.create_inhibitor()
             .map_err(|e| {
                 log::error!("Failed to create inhibitor: {:?}", e);
                 fdo::Error::Failed(format!("Failed to create inhibitor: {:?}", e))
             })?;
 
+        #[cfg(feature = "systemd")]
+        let fd = self.login1.inhibit_idle(
+            env!("CARGO_PKG_NAME"),
+            &format!("{} {}", application_name, reason_for_inhibit)
+        ).await?;
 
         let cookie = self.insert_inhibitor(StoredInhibitor {
+            #[cfg(feature = "wayland")]
             inhibitor,
-            name: application_name.clone(),
-            reason: reason_for_inhibit.clone(),
             sender,
+            #[cfg(feature = "systemd")]
+            _fd: fd,
         }).map_err(|e| fdo::Error::Failed(format!("Failed to insert inhibitor: {}", e)))?;
+
         log::info!(
             "Inhibiting screensaver for {:?} because {:?}. Inhibitor cookie is {:?}.",
             application_name,
@@ -105,14 +128,18 @@ impl OrgFreedesktopScreenSaverServer {
             .map_err(|e| fdo::Error::Failed(format!("Failed to insert inhibitor: {:?}", e)))?;
         match inhibitors_by_cookie.entry(cookie) {
             std::collections::hash_map::Entry::Occupied(e) => if e.get().sender.as_ref() == sender {
-                let inhibitor = e.remove();
-                match self.inhibit_manager.destroy_inhibitor(inhibitor.inhibitor) {
-                    Ok(_) => Ok(()),
+                let _inhibitor = e.remove();
+
+                #[cfg(feature = "wayland")]
+                match self.inhibit_manager.destroy_inhibitor(_inhibitor.inhibitor) {
+                    Ok(_) => (),
                     Err(e) => {
                         log::error!("Failed to destroy inhibitor: {:?}", e);
-                        Err(fdo::Error::Failed(format!("Failed to destroy inhibitor: {:?}", e)))
+                        return Err(fdo::Error::Failed(format!("Failed to destroy inhibitor: {:?}", e)));
                     }
-                }
+                };
+
+                Ok(())
             } else {
                 Err(fdo::Error::Failed(format!("Sender does not match for cookie {}, '{:?}' != '{:?}'",
                                                cookie, e.get().sender, hdr.sender())))
@@ -152,11 +179,16 @@ pub async fn main() -> anyhow::Result<()> {
 
     log::info!("Starting screensaver bridge");
 
+    #[cfg(feature = "wayland")]
     log::info!("Waiting for wayland compositor");
+    #[cfg(feature = "wayland")]
     let inhibit_manager = Arc::new(wayland::get_inhibit_manager().await?);
 
     let inhibitors_by_cookie = Arc::new(Mutex::new(HashMap::new()));
     let screen_saver = OrgFreedesktopScreenSaverServer {
+        #[cfg(feature = "systemd")]
+        login1: Login1Client::new().await?,
+        #[cfg(feature = "wayland")]
         inhibit_manager: inhibit_manager.clone(),
         inhibitors_by_cookie: inhibitors_by_cookie.clone(),
     };
@@ -167,11 +199,18 @@ pub async fn main() -> anyhow::Result<()> {
         .serve_at("/org/freedesktop/ScreenSaver", screen_saver)?
         .build().await?;
 
+    #[cfg(feature = "wayland")]
     let inhibit_manager_ref = inhibit_manager.clone();
     let inhibitors_ref = inhibitors_by_cookie.clone();
     let connection_ref = connection.clone();
     let heartbeat_handle = tokio::spawn(async move {
-        heartbeat(heartbeat_terminator, inhibit_manager_ref, inhibitors_ref, connection_ref).await
+        heartbeat(
+            heartbeat_terminator,
+            #[cfg(feature = "wayland")]
+            inhibit_manager_ref,
+            inhibitors_ref,
+            connection_ref,
+        ).await
     });
 
     // Run until SIGTERM/SIGHUP/SIGINT
@@ -186,15 +225,21 @@ pub async fn main() -> anyhow::Result<()> {
         log::error!("Error closing D-Bus connection: {:?}", e);
     }
 
-    let mut inhibitors = inhibitors_by_cookie.lock()
-        .expect("Could not obtain lock on inhibitors map for clean up");
+    // org.freedesktop.login1 inhibitors get freed on drop, and thus require no clean up from us. But the Wayland
+    // idle-inhibit protocol requires that we explicitly destroy the inhibitors.
+    // TODO: Just write a wrapper for ZwpIdleInhibitorV1 that does this on drop?
+    #[cfg(feature = "wayland")]
+    {
+        let mut inhibitors = inhibitors_by_cookie.lock()
+            .expect("Could not obtain lock on inhibitors map for clean up");
+        for (cookie, inhibitor) in inhibitors.drain() {
+            log::info!("Uninhibiting {:?}", cookie);
 
-    for (cookie, inhibitor) in inhibitors.drain() {
-        log::info!("Uninhibiting {:?}", cookie);
-        match inhibit_manager.destroy_inhibitor(inhibitor.inhibitor.clone()) {
-            Ok(_) => (),
-            Err(e) => {
-                log::error!("Failed to destroy inhibitor: {:?}", e);
+            match inhibit_manager.destroy_inhibitor(inhibitor.inhibitor.clone()) {
+                Ok(_) => (),
+                Err(e) => {
+                    log::error!("Failed to destroy inhibitor: {:?}", e);
+                }
             }
         }
     }
@@ -206,6 +251,7 @@ pub async fn main() -> anyhow::Result<()> {
 // stale inhibitors active.
 async fn heartbeat(
     mut terminator: watch::Receiver<bool>,
+    #[cfg(feature = "wayland")]
     inhibit_manager: Arc<InhibitorManager>,
     inhibitors_by_cookie: Arc<Mutex<HashMap<u32, StoredInhibitor>>>,
     connection: zbus::Connection
@@ -236,13 +282,12 @@ async fn heartbeat(
                                 true
                             } else {
                                 log::info!("Missing sender '{}', uninhibiting {:?}", inhibitor.sender, cookie);
-                                match inhibit_manager.destroy_inhibitor(inhibitor.inhibitor.clone()) {
-                                    Ok(_) => false,
-                                    Err(e) => {
-                                        log::error!("Failed to destroy inhibitor: {:?}", e);
-                                        false
-                                    }
+
+                                #[cfg(feature = "wayland")]
+                                if let Err(e) = inhibit_manager.destroy_inhibitor(inhibitor.inhibitor.clone()) {
+                                    log::error!("Failed to destroy inhibitor: {:?}", e);
                                 }
+                                false
                             }
                         });
                     },
