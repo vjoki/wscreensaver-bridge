@@ -5,7 +5,8 @@
 mod wayland;
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::AtomicU32;
+use std::sync::{atomic, Arc, Mutex};
 
 use zbus::fdo;
 use zbus_macros::interface;
@@ -23,7 +24,7 @@ struct StoredInhibitor {
 
 #[derive(Debug)]
 struct OrgFreedesktopScreenSaverServer {
-    inhibit_manager: InhibitorManager,
+    inhibit_manager: Arc<InhibitorManager>,
     inhibitors_by_cookie: Arc<Mutex<HashMap<u32, StoredInhibitor>>>,
 }
 
@@ -113,35 +114,61 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
             record.args()
         )
     });
-
     log_builder.filter_level(log::LevelFilter::Info);
-
     log_builder.init();
+
+    let running = Arc::new(AtomicU32::new(1));
+    let r = running.clone();
+    ctrlc::set_handler(move || {
+        r.store(0, atomic::Ordering::Relaxed);
+        atomic_wait::wake_all(&*r);
+    })?;
 
     log::info!("Starting screensaver bridge");
 
     log::info!("Waiting for wayland compositor");
-    let inhibit_manager = wayland::get_inhibit_manager().await?;
+    let inhibit_manager = Arc::new(wayland::get_inhibit_manager().await?);
 
     let inhibitors_by_cookie = Arc::new(Mutex::new(HashMap::new()));
     let screen_saver = OrgFreedesktopScreenSaverServer {
-        inhibit_manager,
-        inhibitors_by_cookie,
+        inhibit_manager: inhibit_manager.clone(),
+        inhibitors_by_cookie: inhibitors_by_cookie.clone(),
     };
 
     log::log!(log::Level::Info, "Starting ScreenSaver to Wayland bridge");
-    let _connection = zbus::connection::Builder::session()?
+    let connection = zbus::connection::Builder::session()?
         .name("org.freedesktop.ScreenSaver")?
         .serve_at("/org/freedesktop/ScreenSaver", screen_saver)?
         .build().await?;
 
-    // Run forever.
-    std::future::pending::<()>().await;
-    unreachable!()
 
+    // Run until SIGTERM/SIGHUP/SIGINT
+    loop {
+        atomic_wait::wait(&running, 1);
+        // wait can return spuriously, so we need to double check the value.
+        if running.load(atomic::Ordering::Relaxed) == 0 {
+            break
+        }
+    }
 
+    log::info!("Stopping screensaver bridge, cleaning up any left over inhibitors...");
+    // This should also close the ObjectServer? We don't want to accept any new inhibitors no more.
+    if let Err(e) = connection.close().await {
+        log::error!("Error closing D-Bus connection: {:?}", e);
+    }
 
+    let mut inhibitors = inhibitors_by_cookie.lock()
+        .expect("Could not obtain lock on inhibitors map for clean up");
 
+    for (cookie, inhibitor) in inhibitors.drain() {
+        log::info!("Uninhibiting {:?}", cookie);
+        match inhibit_manager.destroy_inhibitor(inhibitor.inhibitor.clone()) {
+            Ok(_) => (),
+            Err(e) => {
+                log::error!("Failed to destroy inhibitor: {:?}", e);
+            }
+        }
+    }
 
-
+    Ok(())
 }
