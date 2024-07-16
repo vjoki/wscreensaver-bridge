@@ -3,19 +3,14 @@
 // inhibitor protocol.
 
 mod wayland;
-mod xdg_screensaver;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use dbus::channel::MatchingReceiver;
-use dbus::message::MatchRule;
-use dbus_crossroads::Crossroads;
-use dbus_tokio::connection;
-use futures::future;
+use zbus::fdo;
+use zbus_macros::interface;
 use wayland::InhibitorManager;
 use wayland_protocols::wp::idle_inhibit::zv1::client::zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1;
-use xdg_screensaver::OrgFreedesktopScreenSaver;
 
 // TODO: add a way to list inhibitors
 #[allow(dead_code)]
@@ -29,77 +24,78 @@ struct StoredInhibitor {
 #[derive(Debug)]
 struct OrgFreedesktopScreenSaverServer {
     inhibit_manager: InhibitorManager,
-    inhibitors_by_cookie: HashMap<u32, StoredInhibitor>,
+    inhibitors_by_cookie: Arc<Mutex<HashMap<u32, StoredInhibitor>>>,
 }
 
 impl OrgFreedesktopScreenSaverServer {
-    fn insert_inhibitor(&mut self, inhibitor: StoredInhibitor) -> u32 {
+    fn insert_inhibitor(&self, inhibitor: StoredInhibitor) -> Result<u32, String> {
         // find an insert a new cookie. we're locked so this should be gucci
         let cookie = loop {
-            let cookie = rand::random();
-            if !self.inhibitors_by_cookie.contains_key(&cookie) {
+            let cookie = fastrand::u32(..);
+            if !self.inhibitors_by_cookie
+                .lock().map_err(|e| format!("{:?}", e))?
+                .contains_key(&cookie)
+            {
                 break cookie;
             }
         };
-        self.inhibitors_by_cookie.insert(cookie, inhibitor);
-        cookie
+        self.inhibitors_by_cookie
+            .lock().map_err(|e| format!("{:?}", e))?
+            .insert(cookie, inhibitor);
+        Ok(cookie)
     }
 }
 
-impl OrgFreedesktopScreenSaver for Arc<Mutex<OrgFreedesktopScreenSaverServer>> {
-    fn inhibit(
-        &mut self,
+#[interface(name = "org.freedesktop.ScreenSaver")]
+impl OrgFreedesktopScreenSaverServer {
+    async fn inhibit(
+        &self,
         application_name: String,
         reason_for_inhibit: String,
-    ) -> Result<(u32,), dbus::MethodErr> {
-        let inhibitor = self.lock().unwrap().inhibit_manager.create_inhibitor();
-        if let Err(e) = inhibitor {
-            log::error!("Failed to create inhibitor: {:?}", e);
-            return Err(dbus::MethodErr::failed(&format!(
-                "Failed to create inhibitor: {:?}",
-                e
-            )));
-        }
-        let cookie = self.lock().unwrap().insert_inhibitor(StoredInhibitor {
-            inhibitor: inhibitor.unwrap(),
+    ) -> fdo::Result<u32> {
+
+        let inhibitor = self.inhibit_manager.create_inhibitor()
+            .map_err(|e| {
+                log::error!("Failed to create inhibitor: {:?}", e);
+                fdo::Error::Failed(format!("Failed to create inhibitor: {:?}", e))
+            })?;
+
+
+        let cookie = self.insert_inhibitor(StoredInhibitor {
+            inhibitor,
             name: application_name.clone(),
             reason: reason_for_inhibit.clone(),
-        });
+        }).map_err(|e| fdo::Error::Failed(format!("Failed to insert inhibitor: {}", e)))?;
         log::info!(
             "Inhibiting screensaver for {:?} because {:?}. Inhibitor cookie is {:?}.",
             application_name,
             reason_for_inhibit,
             cookie,
         );
-        return Ok((cookie,));
+
+        Ok(cookie)
     }
 
-    fn un_inhibit(&mut self, cookie: u32) -> Result<(), dbus::MethodErr> {
+    async fn un_inhibit(
+        &self,
+        cookie: u32
+    ) -> fdo::Result<()> {
         log::info!("Uninhibiting {:?}", cookie);
-        let inhibitor = self.lock().unwrap().inhibitors_by_cookie.remove(&cookie);
-        return match inhibitor {
-            None => Err(dbus::MethodErr::failed(&format!(
-                "No inhibitor with cookie {}",
-                cookie
-            ))),
-            Some(inhibitor) => {
-                match self
-                    .lock()
-                    .unwrap()
-                    .inhibit_manager
-                    .destroy_inhibitor(inhibitor.inhibitor)
-                {
-                    Ok(_) => Ok(()),
-                    Err(e) => {
-                        log::error!("Failed to destroy inhibitor: {:?}", e);
-                        Err(dbus::MethodErr::failed(&format!(
-                            "Failed to destroy inhibitor: {:?}",
-                            e
-                        )))
-                    }
+
+        let inhibitor = self.inhibitors_by_cookie.lock()
+            .map_err(|e| fdo::Error::Failed(format!("Failed to insert inhibitor: {:?}", e)))?
+            .remove(&cookie);
+
+        match inhibitor {
+            None => Err(fdo::Error::Failed(format!("No inhibitor with cookie {}", cookie))),
+            Some(inhibitor) => match self.inhibit_manager.destroy_inhibitor(inhibitor.inhibitor) {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    log::error!("Failed to destroy inhibitor: {:?}", e);
+                    Err(fdo::Error::Failed(format!("Failed to destroy inhibitor: {:?}", e)))
                 }
             }
-        };
+        }
     }
 }
 
@@ -124,60 +120,28 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     log::info!("Starting screensaver bridge");
 
-    // Connect to the D-Bus session bus (this is blocking, unfortunately).
-    let (resource, c) = connection::new_session_sync()?;
-
-    // The resource is a task that should be spawned onto a tokio compatible
-    // reactor ASAP. If the resource ever finishes, you lost connection to D-Bus.
-    //
-    // To shut down the connection, both call _handle.abort() and drop the connection.
-    let _handle = tokio::spawn(async {
-        let err = resource.await;
-        panic!("Lost connection to D-Bus: {}", err);
-    });
-
-    // Let's request a name on the bus, so that clients can find us.
-    c.request_name("org.freedesktop.ScreenSaver", false, true, false)
-        .await?;
-
-    let mut cr = Crossroads::new();
-
-    // Enable async support for the crossroads instance.
-    cr.set_async_support(Some((
-        c.clone(),
-        Box::new(|x| {
-            // spawn and put a log statement inside
-            tokio::spawn(async move {
-                x.await;
-            });
-        }),
-    )));
-
     log::info!("Waiting for wayland compositor");
     let inhibit_manager = wayland::get_inhibit_manager().await?;
 
-    let iface_token = xdg_screensaver::register_org_freedesktop_screen_saver(&mut cr);
-    cr.insert(
-        "/org/freedesktop/ScreenSaver",
-        &[iface_token],
-        Arc::new(Mutex::new(OrgFreedesktopScreenSaverServer {
-            inhibit_manager,
-            inhibitors_by_cookie: HashMap::new(),
-        })),
-    );
-
-    // TODO: list the inhibitors that are active
+    let inhibitors_by_cookie = Arc::new(Mutex::new(HashMap::new()));
+    let screen_saver = OrgFreedesktopScreenSaverServer {
+        inhibit_manager,
+        inhibitors_by_cookie,
+    };
 
     log::log!(log::Level::Info, "Starting ScreenSaver to Wayland bridge");
-    c.start_receive(
-        MatchRule::new_method_call(),
-        Box::new(move |msg, conn| {
-            cr.handle_message(msg, conn).unwrap();
-            true
-        }),
-    );
+    let _connection = zbus::connection::Builder::session()?
+        .name("org.freedesktop.ScreenSaver")?
+        .serve_at("/org/freedesktop/ScreenSaver", screen_saver)?
+        .build().await?;
 
     // Run forever.
-    future::pending::<()>().await;
+    std::future::pending::<()>().await;
     unreachable!()
+
+
+
+
+
+
 }
