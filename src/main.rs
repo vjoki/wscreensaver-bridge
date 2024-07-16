@@ -151,7 +151,7 @@ impl OrgFreedesktopScreenSaverServer {
     }
 }
 
-#[tokio::main(flavor = "multi_thread")]
+#[tokio::main(flavor = "current_thread")]
 pub async fn main() -> anyhow::Result<()> {
     // configure logger to print thread id
     let mut log_builder = pretty_env_logger::formatted_builder();
@@ -159,8 +159,7 @@ pub async fn main() -> anyhow::Result<()> {
         use std::io::Write;
         writeln!(
             buf,
-            "[{:?}][{}] {}",
-            std::thread::current().id(),
+            "[{}] {}",
             record.level(),
             record.args()
         )
