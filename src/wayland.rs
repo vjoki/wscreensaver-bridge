@@ -135,7 +135,7 @@ impl InhibitorManager {
     }
 }
 
-pub async fn get_inhibit_manager() -> Result<InhibitorManager, Box<dyn std::error::Error>> {
+pub async fn get_inhibit_manager() -> anyhow::Result<InhibitorManager> {
     // get wayland display
     let conn =
         wayland_client::Connection::connect_to_env().expect("Failed to connect to Wayland server");

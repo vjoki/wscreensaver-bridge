@@ -1,13 +1,16 @@
 #![forbid(unsafe_code)]
 // Bridbe between the org.freedesktop.ScreenSaver interface and the Wayland idle
 // inhibitor protocol.
-
 mod wayland;
 
-use std::collections::HashMap;
-use std::sync::atomic::AtomicU32;
-use std::sync::{atomic, Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
+use tokio::sync::watch;
+use tokio::time::{self, Duration};
+use anyhow::Context as _;
+use zbus::message::Header;
+use zbus::names::UniqueName;
 use zbus::fdo;
 use zbus_macros::interface;
 use wayland::InhibitorManager;
@@ -20,11 +23,13 @@ struct StoredInhibitor {
     inhibitor: ZwpIdleInhibitorV1,
     name: String,
     reason: String,
+    sender: UniqueName<'static>,
 }
 
 #[derive(Debug)]
 struct OrgFreedesktopScreenSaverServer {
     inhibit_manager: Arc<InhibitorManager>,
+    // NOTE: Must not be held across await points.
     inhibitors_by_cookie: Arc<Mutex<HashMap<u32, StoredInhibitor>>>,
 }
 
@@ -51,9 +56,15 @@ impl OrgFreedesktopScreenSaverServer {
 impl OrgFreedesktopScreenSaverServer {
     async fn inhibit(
         &self,
+        #[zbus(header)]
+        hdr: Header<'_>,
         application_name: String,
         reason_for_inhibit: String,
     ) -> fdo::Result<u32> {
+        let Some(sender) = hdr.sender().map(|x| x.to_owned()) else {
+            log::error!("No sender provided");
+            return Err(fdo::Error::Failed("No sender provided".to_string()));
+        };
 
         let inhibitor = self.inhibit_manager.create_inhibitor()
             .map_err(|e| {
@@ -66,6 +77,7 @@ impl OrgFreedesktopScreenSaverServer {
             inhibitor,
             name: application_name.clone(),
             reason: reason_for_inhibit.clone(),
+            sender,
         }).map_err(|e| fdo::Error::Failed(format!("Failed to insert inhibitor: {}", e)))?;
         log::info!(
             "Inhibiting screensaver for {:?} because {:?}. Inhibitor cookie is {:?}.",
@@ -79,29 +91,41 @@ impl OrgFreedesktopScreenSaverServer {
 
     async fn un_inhibit(
         &self,
+        #[zbus(header)]
+        hdr: Header<'_>,
         cookie: u32
     ) -> fdo::Result<()> {
         log::info!("Uninhibiting {:?}", cookie);
+        let Some(sender) = hdr.sender().map(|x| x.to_owned()) else {
+            log::error!("No sender provided");
+            return Err(fdo::Error::Failed("No sender provided".to_string()));
+        };
 
-        let inhibitor = self.inhibitors_by_cookie.lock()
-            .map_err(|e| fdo::Error::Failed(format!("Failed to insert inhibitor: {:?}", e)))?
-            .remove(&cookie);
-
-        match inhibitor {
-            None => Err(fdo::Error::Failed(format!("No inhibitor with cookie {}", cookie))),
-            Some(inhibitor) => match self.inhibit_manager.destroy_inhibitor(inhibitor.inhibitor) {
-                Ok(_) => Ok(()),
-                Err(e) => {
-                    log::error!("Failed to destroy inhibitor: {:?}", e);
-                    Err(fdo::Error::Failed(format!("Failed to destroy inhibitor: {:?}", e)))
+        let mut inhibitors_by_cookie = self.inhibitors_by_cookie.lock()
+            .map_err(|e| fdo::Error::Failed(format!("Failed to insert inhibitor: {:?}", e)))?;
+        match inhibitors_by_cookie.entry(cookie) {
+            std::collections::hash_map::Entry::Occupied(e) => if e.get().sender.as_ref() == sender {
+                let inhibitor = e.remove();
+                match self.inhibit_manager.destroy_inhibitor(inhibitor.inhibitor) {
+                    Ok(_) => Ok(()),
+                    Err(e) => {
+                        log::error!("Failed to destroy inhibitor: {:?}", e);
+                        Err(fdo::Error::Failed(format!("Failed to destroy inhibitor: {:?}", e)))
+                    }
                 }
-            }
+            } else {
+                Err(fdo::Error::Failed(format!("Sender does not match for cookie {}, '{:?}' != '{:?}'",
+                                               cookie, e.get().sender, hdr.sender())))
+            },
+            std::collections::hash_map::Entry::Vacant(_) => {
+                Err(fdo::Error::Failed(format!("No inhibitor with cookie {}", cookie)))
+            },
         }
     }
 }
 
 #[tokio::main(flavor = "multi_thread")]
-pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
+pub async fn main() -> anyhow::Result<()> {
     // configure logger to print thread id
     let mut log_builder = pretty_env_logger::formatted_builder();
     log_builder.format(|buf, record| {
@@ -117,12 +141,14 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     log_builder.filter_level(log::LevelFilter::Info);
     log_builder.init();
 
-    let running = Arc::new(AtomicU32::new(1));
-    let r = running.clone();
+    let (terminator_tx, mut terminator_rx) = watch::channel(false);
+    let heartbeat_terminator = terminator_tx.subscribe();
+    let terminator = terminator_tx.clone();
     ctrlc::set_handler(move || {
-        r.store(0, atomic::Ordering::Relaxed);
-        atomic_wait::wake_all(&*r);
-    })?;
+        if let Err(e) = terminator.send(true) {
+            log::error!("Sending termination signal failed: {:?}", e);
+        }
+    }).context("signal handler")?;
 
     log::info!("Starting screensaver bridge");
 
@@ -141,15 +167,18 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .serve_at("/org/freedesktop/ScreenSaver", screen_saver)?
         .build().await?;
 
+    let inhibit_manager_ref = inhibit_manager.clone();
+    let inhibitors_ref = inhibitors_by_cookie.clone();
+    let connection_ref = connection.clone();
+    let heartbeat_handle = tokio::spawn(async move {
+        heartbeat(heartbeat_terminator, inhibit_manager_ref, inhibitors_ref, connection_ref).await
+    });
 
     // Run until SIGTERM/SIGHUP/SIGINT
-    loop {
-        atomic_wait::wait(&running, 1);
-        // wait can return spuriously, so we need to double check the value.
-        if running.load(atomic::Ordering::Relaxed) == 0 {
-            break
-        }
-    }
+    terminator_rx.changed().await?;
+
+    // Clean up inhibitor heartbeat.
+    heartbeat_handle.await??;
 
     log::info!("Stopping screensaver bridge, cleaning up any left over inhibitors...");
     // This should also close the ObjectServer? We don't want to accept any new inhibitors no more.
@@ -170,5 +199,66 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    Ok(())
+}
+
+// Shamelessly copied from https://github.com/bdwalton/inhibit-bridge, try to make sure we don't leave any
+// stale inhibitors active.
+async fn heartbeat(
+    mut terminator: watch::Receiver<bool>,
+    inhibit_manager: Arc<InhibitorManager>,
+    inhibitors_by_cookie: Arc<Mutex<HashMap<u32, StoredInhibitor>>>,
+    connection: zbus::Connection
+) -> anyhow::Result<()> {
+    log::info!("Starting inhibitor heartbeat poller");
+    let mut interval = time::interval(Duration::from_secs(10));
+
+    let proxy = fdo::DBusProxy::new(&connection).await?;
+    loop {
+        tokio::select! {
+            biased;
+            _ = terminator.changed() => {
+                break
+            }
+            _ = interval.tick() => if inhibitors_by_cookie.try_lock().is_ok_and(|xs| !xs.is_empty()) {
+                let names: HashSet<UniqueName<'static>> = proxy.list_names().await?
+                    .into_iter()
+                    .filter_map(|x| match x.into_inner() {
+                        zbus::names::BusName::Unique(x) => Some(x),
+                        _ => None,
+                    })
+                    .collect();
+
+                match inhibitors_by_cookie.try_lock() {
+                    Ok(mut inhibitors) => {
+                        inhibitors.retain(|cookie, inhibitor| {
+                            if names.contains(&inhibitor.sender) {
+                                true
+                            } else {
+                                log::info!("Missing sender '{}', uninhibiting {:?}", inhibitor.sender, cookie);
+                                match inhibit_manager.destroy_inhibitor(inhibitor.inhibitor.clone()) {
+                                    Ok(_) => false,
+                                    Err(e) => {
+                                        log::error!("Failed to destroy inhibitor: {:?}", e);
+                                        false
+                                    }
+                                }
+                            }
+                        });
+                    },
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        log::debug!("Inhibitors map already locked, trying again later...");
+                        continue
+                    },
+                    Err(e) => {
+                        log::error!("Terminating heartbeat checker: {:?}", e);
+                        anyhow::bail!(format!("Inhibitors map lock error: {:?}", e))
+                    },
+                };
+            }
+        }
+    }
+
+    log::info!("Stopping inhibitor heartbeat poller");
     Ok(())
 }
