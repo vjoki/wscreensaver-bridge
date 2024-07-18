@@ -169,6 +169,9 @@ struct Args {
     /// set logging level (default: info)
     #[argh(option, default="tracing::Level::INFO")]
     log_level: tracing::Level,
+    /// active inhibitor poll interval in seconds (default: 10)
+    #[argh(option, default="10")]
+    heartbeat_interval: u64,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -221,6 +224,7 @@ pub async fn main() -> anyhow::Result<()> {
     let connection_ref = connection.clone();
     let heartbeat_handle = tokio::spawn(async move {
         heartbeat(
+            args.heartbeat_interval,
             heartbeat_terminator,
             #[cfg(feature = "wayland")]
             inhibit_manager_ref,
@@ -266,14 +270,15 @@ pub async fn main() -> anyhow::Result<()> {
 // Shamelessly copied from https://github.com/bdwalton/inhibit-bridge, try to make sure we don't leave any
 // stale inhibitors active.
 async fn heartbeat(
+    heartbeat_interval: u64,
     mut terminator: watch::Receiver<bool>,
     #[cfg(feature = "wayland")]
     inhibit_manager: Arc<InhibitorManager>,
     inhibitors_by_cookie: Arc<Mutex<HashMap<u32, StoredInhibitor>>>,
     connection: zbus::Connection
 ) -> anyhow::Result<()> {
-    let mut interval = time::interval(Duration::from_secs(10));
     info!("Starting inhibitor heartbeat poller");
+    let mut interval = time::interval(Duration::from_secs(heartbeat_interval));
 
     let proxy = fdo::DBusProxy::new(&connection).await?;
     loop {
