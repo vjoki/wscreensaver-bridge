@@ -72,7 +72,7 @@ impl OrgFreedesktopScreenSaverServer {
 
 #[interface(name = "org.freedesktop.ScreenSaver")]
 impl OrgFreedesktopScreenSaverServer {
-    #[instrument(skip(self, hdr))]
+    #[instrument(skip(self, hdr), fields(sender=?hdr.sender()))]
     async fn inhibit(
         &self,
         #[zbus(header)]
@@ -103,9 +103,9 @@ impl OrgFreedesktopScreenSaverServer {
         })?;
 
         let cookie = self.insert_inhibitor(StoredInhibitor {
+            sender,
             #[cfg(feature = "wayland")]
             inhibitor,
-            sender,
             #[cfg(feature = "systemd")]
             _fd: fd,
         }).map_err(|e| {
@@ -113,31 +113,26 @@ impl OrgFreedesktopScreenSaverServer {
             fdo::Error::Failed(format!("Unable to retain the inhibitor: {}", e))
         })?;
 
-        info!("Inhibiting screensaver for {} because {}.", application_name, reason_for_inhibit);
+        info!(cookie, "Inhibiting screensaver for {} because {}.", application_name, reason_for_inhibit);
 
         Ok(cookie)
     }
 
-    #[instrument(skip(self, hdr))]
+    #[instrument(skip(self, hdr), fields(uninhibit_sender=?hdr.sender()))]
     async fn un_inhibit(
         &self,
         #[zbus(header)]
         hdr: Header<'_>,
         cookie: u32
     ) -> fdo::Result<()> {
-        info!("Uninhibiting");
-        let Some(sender) = hdr.sender().map(|x| x.to_owned()) else {
-            error!("No sender provided");
-            return Err(fdo::Error::Failed("No sender provided".to_string()));
-        };
-
         let mut inhibitors_by_cookie = self.inhibitors_by_cookie.lock()
             .map_err(|e| {
                 error!(error=?e, "Could not obtain lock for inhibitors map");
                 fdo::Error::Failed(format!("Could not obtain lock on inhibitors map for clean up: {:?}", e))
             })?;
         match inhibitors_by_cookie.entry(cookie) {
-            std::collections::hash_map::Entry::Occupied(e) => if e.get().sender.as_ref() == sender {
+            std::collections::hash_map::Entry::Occupied(e) => {
+                info!(inhibit_sender=?e.get().sender, "Uninhibiting");
                 let _inhibitor = e.remove();
 
                 #[cfg(feature = "wayland")]
@@ -150,10 +145,6 @@ impl OrgFreedesktopScreenSaverServer {
                 };
 
                 Ok(())
-            } else {
-                error!(expected_sender=?e.get().sender, sender=?hdr.sender(), "Sender mismatch");
-                Err(fdo::Error::Failed(format!("Sender does not match for cookie {}, '{:?}' != '{:?}'",
-                                               cookie, e.get().sender, hdr.sender())))
             },
             std::collections::hash_map::Entry::Vacant(_) => {
                 error!("Cookie not found");
