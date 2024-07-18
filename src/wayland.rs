@@ -1,5 +1,6 @@
 // get a wayland client
 
+use tracing::trace;
 use wayland_client::{
     backend::WaylandError,
     protocol::{
@@ -88,14 +89,14 @@ impl Dispatch<WlRegistry, ()> for DispatcherListener {
                 version,
             } => {
                 if interface == WL_COMPOSITOR_INTERFACE.name {
-                    log::debug!("Found compositor");
+                    trace!("Found compositor");
                     let compositor =
                         registry.bind::<WlCompositor, _, _>(name, version, qhandle, ());
                     let surface = compositor.create_surface(&qhandle, ());
                     state.dummy_surface = Some(surface);
                 }
                 if interface == ZWP_IDLE_INHIBIT_MANAGER_V1_INTERFACE.name {
-                    log::debug!("Found inhibit manager");
+                    trace!("Found inhibit manager");
                     let manager =
                         registry.bind::<ZwpIdleInhibitManagerV1, _, _>(name, version, qhandle, ());
                     state.manager = Some(manager);
