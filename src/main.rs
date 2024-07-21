@@ -5,9 +5,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use argh::FromArgs;
+use anyhow::Context as _;
 use tokio::sync::watch;
 use tokio::time::{self, Duration};
-use anyhow::Context as _;
+use tokio_stream::wrappers::{IntervalStream, WatchStream};
+use futures_util::stream::{BoxStream, SelectAll, StreamExt};
 use tracing::{error, info, instrument, trace};
 use tracing_subscriber::EnvFilter;
 use zbus::message::Header;
@@ -160,9 +162,10 @@ struct Args {
     /// set logging level (default: info)
     #[argh(option, default="tracing::Level::INFO")]
     log_level: tracing::Level,
-    /// active inhibitor poll interval in seconds (default: 10)
-    #[argh(option, default="10")]
-    heartbeat_interval: u64,
+    /// provide an interval in seconds to poll for active inhibitors using D-Bus ListNames, instead of
+    /// listening for D-Bus NameOwnerChanged signals
+    #[argh(option)]
+    heartbeat_interval: Option<u64>,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -213,8 +216,8 @@ pub async fn main() -> anyhow::Result<()> {
     let inhibit_manager_ref = inhibit_manager.clone();
     let inhibitors_ref = inhibitors_by_cookie.clone();
     let connection_ref = connection.clone();
-    let heartbeat_handle = tokio::spawn(async move {
-        heartbeat(
+    let cleanup_handle = tokio::spawn(async move {
+        inhibitor_cleanup_task(
             args.heartbeat_interval,
             heartbeat_terminator,
             #[cfg(feature = "wayland")]
@@ -227,8 +230,8 @@ pub async fn main() -> anyhow::Result<()> {
     // Run until SIGTERM/SIGHUP/SIGINT
     terminator_rx.changed().await?;
 
-    // Clean up inhibitor heartbeat.
-    heartbeat_handle.await??;
+    // Clean up the inhibitor clean up task.
+    cleanup_handle.await??;
 
     info!("Stopping screensaver bridge, cleaning up any left over inhibitors...");
     // This should also close the ObjectServer? We don't want to accept any new inhibitors no more.
@@ -258,65 +261,110 @@ pub async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-// Shamelessly copied from https://github.com/bdwalton/inhibit-bridge, try to make sure we don't leave any
-// stale inhibitors active.
-async fn heartbeat(
-    heartbeat_interval: u64,
-    mut terminator: watch::Receiver<bool>,
+async fn inhibitor_cleanup_task(
+    heartbeat_interval: Option<u64>,
+    terminator: watch::Receiver<bool>,
     #[cfg(feature = "wayland")]
     inhibit_manager: Arc<InhibitorManager>,
     inhibitors_by_cookie: Arc<Mutex<HashMap<u32, StoredInhibitor>>>,
     connection: zbus::Connection
 ) -> anyhow::Result<()> {
-    info!("Starting inhibitor heartbeat poller");
-    let mut interval = time::interval(Duration::from_secs(heartbeat_interval));
-
+    info!("Starting inhibitor clean up task");
     let proxy = fdo::DBusProxy::new(&connection).await?;
-    loop {
-        tokio::select! {
-            biased;
-            _ = terminator.changed() => {
+
+    enum Message {
+        Terminator(bool),
+        NameOwnerChanged(fdo::NameOwnerChanged),
+        Interval(time::Instant),
+    }
+
+    let mut stream: SelectAll<BoxStream<Message>> = SelectAll::new();
+    stream.push(Box::pin(WatchStream::from_changes(terminator).map(Message::Terminator)));
+
+    if let Some(interval) = heartbeat_interval {
+        stream.push(Box::pin(IntervalStream::new(time::interval(Duration::from_secs(interval))).map(Message::Interval)));
+    } else {
+        stream.push(Box::pin(proxy.receive_name_owner_changed().await?.map(Message::NameOwnerChanged)));
+    }
+
+    while let Some(msg) = stream.next().await {
+        match msg {
+            Message::Terminator(x) => {
+                // Terminator should only ever change from false to true.
+                assert!(x);
                 break
-            }
-            _ = interval.tick() => if inhibitors_by_cookie.try_lock().is_ok_and(|xs| !xs.is_empty()) {
-                let names: HashSet<UniqueName<'static>> = proxy.list_names().await?
-                    .into_iter()
-                    .filter_map(|x| match x.into_inner() {
-                        zbus::names::BusName::Unique(x) => Some(x),
-                        _ => None,
-                    })
-                    .collect();
+            },
+            Message::Interval(_x) => {
+                // Shamelessly copied from https://github.com/bdwalton/inhibit-bridge, try to make sure we don't leave
+                // any stale inhibitors active.
+                if inhibitors_by_cookie.try_lock().is_ok_and(|xs| !xs.is_empty()) {
+                    let names: HashSet<UniqueName<'static>> = proxy.list_names().await?
+                        .into_iter()
+                        .filter_map(|x| match x.into_inner() {
+                            zbus::names::BusName::Unique(x) => Some(x),
+                            _ => None,
+                        })
+                        .collect();
 
-                match inhibitors_by_cookie.try_lock() {
-                    Ok(mut inhibitors) => {
-                        inhibitors.retain(|cookie, inhibitor| {
-                            if names.contains(&inhibitor.sender) {
-                                trace!(cookie, sender=%inhibitor.sender, "Sender still connected, keeping inhibitor alive");
-                                true
-                            } else {
-                                info!(cookie, sender=%inhibitor.sender, "Sender not connected, uninhibiting");
-
-                                #[cfg(feature = "wayland")]
-                                if let Err(e) = inhibit_manager.destroy_inhibitor(inhibitor.inhibitor.clone()) {
-                                    error!(cookie, error=?e, "Failed to destroy inhibitor");
+                    match inhibitors_by_cookie.try_lock() {
+                        Ok(mut inhibitors) => {
+                            inhibitors.retain(|cookie, inhibitor| {
+                                if names.contains(&inhibitor.sender) {
+                                    trace!(cookie, sender=%inhibitor.sender, "Sender still connected, keeping inhibitor alive");
+                                    true
+                                } else {
+                                    info!(cookie, sender=%inhibitor.sender, "Sender not connected, uninhibiting");
+                                    #[cfg(feature = "wayland")]
+                                    if let Err(e) = inhibit_manager.destroy_inhibitor(inhibitor.inhibitor.clone()) {
+                                        error!(cookie, error=?e, "Failed to destroy Wayland inhibitor");
+                                    }
+                                    false
                                 }
-                                false
+                            });
+                        },
+                        Err(std::sync::TryLockError::WouldBlock) => {
+                            trace!("Inhibitors map already locked, trying again later...");
+                            continue
+                        },
+                        Err(e) => {
+                            error!(error=?e, "Terminating heartbeat checker");
+                            anyhow::bail!(format!("Inhibitors map lock error: {:?}", e))
+                        },
+                    };
+                }
+            },
+            Message::NameOwnerChanged(sig) => {
+                // Absolutely no idea when args() can fail, so just log the error.
+                if let Ok(changed) = sig.args().map_err(|e| error!(error=?e, "Reading NameOwnerChanged failed")) {
+                    trace!(changed=?changed, "Received a NameOwnerChanged signal");
+                    if let zbus::names::BusName::Unique(name) = changed.name() {
+                        if changed.new_owner.is_none() && changed.old_owner.as_ref().is_some_and(|x| x == name) {
+                            match inhibitors_by_cookie.lock() {
+                                Ok(mut inhibitors) => {
+                                    #[allow(clippy::needless_bool)]
+                                    inhibitors.retain(|cookie, inhibitor| if &inhibitor.sender == name {
+                                        info!(cookie, sender=%name, "Sender disconnected, uninhibiting");
+                                        #[cfg(feature = "wayland")]
+                                        if let Err(e) = inhibit_manager.destroy_inhibitor(inhibitor.inhibitor.clone()) {
+                                            error!(cookie, error=?e, "Failed to destroy Wayland inhibitor");
+                                        }
+                                        false
+                                    } else {
+                                        true
+                                    });
+                                },
+                                Err(e) => {
+                                    error!(error=?e, "Terminating inhibitor clean up task");
+                                    anyhow::bail!(format!("Inhibitors map lock error: {:?}", e));
+                                },
                             }
-                        });
-                    },
-                    Err(std::sync::TryLockError::WouldBlock) => {
-                        trace!("Inhibitors map already locked, trying again later...");
-                        continue
-                    },
-                    Err(e) => {
-                        error!(error=?e, "Terminating heartbeat checker");
-                        anyhow::bail!(format!("Inhibitors map lock error: {:?}", e))
-                    },
-                };
+                        }
+                    }
+                }
             }
         }
     }
 
-    info!("Stopping inhibitor heartbeat poller");
+    info!("Stopping inhibitor clean up task");
     Ok(())
 }

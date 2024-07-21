@@ -17,6 +17,8 @@ zbus_macros = "4.3.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 fastrand = "2.1.0"
+futures-util = "0.3.30"
+tokio-stream = { version = "0.1.15", features = ["time", "sync"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 wayland-client = { version = "0.31.3", optional = true }
 wayland-protocols = { version = "0.32.1", features = ["unstable", "client"], optional = true }
