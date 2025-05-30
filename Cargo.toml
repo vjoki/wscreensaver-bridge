@@ -12,8 +12,8 @@ systemd = []
 wayland = ["dep:wayland-client", "dep:wayland-protocols"]
 
 [dependencies]
-zbus = { version = "4.3.1", default-features = false, features = ["tokio"] }
-zbus_macros = "4.3.1"
+zbus = { version = "5.5.0", default-features = false, features = ["tokio"] }
+zbus_macros = "5.5.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 fastrand = "2.1.0"

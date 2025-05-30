@@ -2,7 +2,6 @@
 allow = [
     "MIT",
     "BSD-3-Clause",
-    "ISC",
     "Unicode-3.0",
     "GPL-2.0",
 ]
